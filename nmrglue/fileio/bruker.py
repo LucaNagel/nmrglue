@@ -5,8 +5,6 @@ files.
 """
 
 from __future__ import print_function, division
-import locale
-import io
 
 __developer_info__ = """
 Bruker file format information
@@ -38,6 +36,9 @@ import numpy as np
 
 from . import fileiobase
 from ..process import proc_base
+
+from jcamp import JCAMP_reader
+import re
 
 
 # data creation
@@ -123,10 +124,7 @@ def add_axis_to_udic(udic, dic, udim, strip_fake):
         pro_file = "procs"
 
     if acq_file in dic:
-        if b_dim == 0:
-            sw = dic[acq_file]["SW_h"]
-        else:
-            sw = dic[acq_file]["SW"] * dic[acq_file]["SFO1"]
+        sw = dic[acq_file]["SW_h"]
     elif pro_file in dic:
         sw = dic[pro_file]["SW_p"]
         # procNs files store sw (in Hz) with the 'SW_p' key instead of 'SW_h'.
@@ -434,6 +432,195 @@ def read(dir=".", bin_file=None, acqus_files=None, pprog_file=None, shape=None,
     return dic, data
 
 
+
+
+# Global read/write function and related utilities
+
+def read2D(dir=".", bin_file=None, acqus_files=None, pprog_file=None, shape=None,
+         cplex=None, big=None, isfloat=None, read_pulseprogram=True,
+         read_acqus=True, read_method=True, procs_files=None, 
+         method_files=None, read_procs=True):
+    """
+    Read Bruker files from a directory.
+
+    Parameters
+    ----------
+    dir : str
+        Directory to read from.
+    bin_file : str, optional
+        Filename of binary file in directory. None uses standard files.
+    acqus_files : list, optional
+        List of filename(s) of acqus parameter files in directory. None uses
+        standard files.
+    pprog_file : str, optional
+        Filename of pulse program in directory. None uses standard files.
+    shape : tuple, optional
+        Shape of resulting data.  None will guess the shape from the spectral
+        parameters.
+    cplex : bool, optional
+        True is direct dimension is complex, False otherwise. None will guess
+        quadrature from spectral parameters.
+    big : bool or None, optional
+        Endianness of binary file. True for big-endian, False for
+        little-endian, None to determine endianness from acqus file(s).
+    isfloat : bool or None, optional
+        Data type of binary file. True for float64, False for int32. None to
+        determine data type from acqus file(s).
+    read_pulseprogram : bool, optional
+        True to read pulse program, False prevents reading.
+    read_acqus : bool, optional
+        True to read acqus files(s), False prevents reading.
+    procs_files : list, optional
+        List of filename(s) of procs parameter files in directory. None uses
+        standard files.
+    read_procs : bool, optional
+        True to read procs files(s), False prevents reading.
+
+    Returns
+    -------
+    dic : dict
+        Dictionary of Bruker parameters.
+    data : ndarray
+        Array of NMR data.
+
+    See Also
+    --------
+    read_pdata : Read Bruker processed files.
+    read_lowmem : Low memory reading of Bruker files.
+    write : Write Bruker files.
+
+    """
+    if os.path.isdir(dir) is not True:
+        raise IOError("directory %s does not exist" % (dir))
+
+    # Take a shot at reading the procs file
+    if read_procs:
+        dic = read_procs_file(dir, procs_files)
+    else:
+        dic = dict()
+        # create an empty dictionary
+        
+
+    # determine parameter automatically
+    if bin_file is None:
+        if os.path.isfile(os.path.join(dir, "fid")):
+            bin_file = "fid"
+        elif os.path.isfile(os.path.join(dir, "ser")):
+            bin_file = "ser"
+
+        # Look two directory levels lower.
+        elif os.path.isdir(os.path.dirname(os.path.dirname(dir))):
+
+            # ! change the dir
+            dir = os.path.dirname(os.path.dirname(dir))
+
+            if os.path.isfile(os.path.join(dir, "fid")):
+                bin_file = "fid"
+            elif os.path.isfile(os.path.join(dir, "ser")):
+                bin_file = "ser"
+            else:
+                mesg = "No Bruker binary file could be found in %s"
+                raise IOError(mesg % (dir))
+        else:
+            mesg = "No Bruker binary file could be found in %s"
+            raise IOError(mesg % (dir))
+
+    if read_acqus:
+        # read the acqus_files and add to the dictionary
+        acqus_dic = read_acqus_file(dir, acqus_files)
+        #dic['acqp'] = acqus_dic;
+        dic = _merge_dict(dic, acqus_dic)
+
+    if pprog_file is None:
+        pprog_file = "pulseprogram"
+
+    # read the pulse program and add to the dictionary
+    if read_pulseprogram:
+        try:
+#            dic["pprog"] = read_pprog(os.path.join(dir, pprog_file))
+            pprog_dic = read_ppg_Luca(os.path.join(dir, pprog_file))
+            dic = _merge_dict(dic, pprog_dic)
+        except:
+            warn('Error reading the pulse program')
+
+    # read the method file and add to the dictionary            
+    if read_method:
+        method_dic = read_method_file_Luca(dir, method_files)
+        dic = _merge_dict(dic, method_dic)
+
+    # determine file size and add to the dictionary
+    dic["FILE_SIZE"] = os.stat(os.path.join(dir, bin_file)).st_size
+
+    # determine shape and complexity for direct dim if needed
+    if shape is None or cplex is None:
+        gshape, gcplex = guess_shape(dic)
+        if gcplex is True:    # divide last dim by 2 if complex
+            t = list(gshape)
+            t[-1] = t[-1] // 2
+            gshape = tuple(t)
+    if shape is None:
+        shape = gshape
+    if cplex is None:
+        cplex = gcplex
+
+    # determine endianness (assume little-endian unless BYTORDA is 1)
+    if big is None:
+        big = False     # default value
+        if "acqp" in dic and "bytorda" in dic["acqp"]:
+            if dic["acqp"]["bytorda"] == 1:
+                big = True
+            else:
+                big = False
+
+    # determine data type (assume int32 unless DTYPA is 2)
+    rawdata_format = None
+    if rawdata_format is None:
+        rawdata_format = False     # default value GO_32BIT_SGN_INT
+        if "acqp" in dic and "go_32" in dic["acqp"]:
+            if dic["acqp"]["DTYPA"] == 2:
+                isfloat = True
+            else:
+                isfloat = False
+
+    # determine data type (assume int32 unless DTYPA is 2)
+    if isfloat is None:
+        isfloat = False     # default value
+        if "acqp" in dic and "GO_raw_data_format" in dic["acqp"]:
+            if dic["acqp"]["GO_raw_data_format"] == "GO_32BIT_SGN_INT":
+                isfloat = False
+            else:
+                isfloat = False
+
+    # determine data type (assume int32 unless DTYPA is 2)
+    cplex = False # default value
+    if "acqp" in dic and "aq_mod" in dic["acqp"]:
+        if dic["acqp"]["aq_mod"] == "qf":
+            cplex = False
+        elif dic["acqp"]["aq_mod"] == "qseq":
+            cplex = True
+        elif dic["acqp"]["aq_mod"] == "qsim":
+            cplex = True
+        elif dic["acqp"]["aq_mod"] == "qdig":
+            cplex = True
+        else:
+            cplex = False
+            
+    dic = str2num(dic)
+
+
+    # read the binary file
+    f = os.path.join(dir, bin_file)
+    null, data = read_fid_Luca(f, parameters = dic, shape=shape, cplex=cplex,
+                               big=big, isfloat=isfloat)
+#    null, data = read_binary(f, shape=shape, cplex=cplex, big=big,
+#                             isfloat=isfloat)
+    
+    return dic, data
+
+
+
+
+
 def read_lowmem(dir=".", bin_file=None, acqus_files=None, pprog_file=None,
                 shape=None, cplex=None, big=None, isfloat=None,
                 read_pulseprogram=True, read_acqus=True, procs_files=None,
@@ -501,6 +688,7 @@ def read_lowmem(dir=".", bin_file=None, acqus_files=None, pprog_file=None,
 
     # read the pulse program and add to the dictionary
     if read_pulseprogram:
+        # dic["pprog"] = read_pulseprogram(os.path.join(dir, pprog_file))
         dic["pprog"] = read_pprog(os.path.join(dir, pprog_file))
 
     # determine file size and add to the dictionary
@@ -562,16 +750,67 @@ def read_acqus_file(dir='.', acqus_files=None):
     """
     if acqus_files is None:
         acqus_files = []
-        for f in ["acqus", "acqu2s", "acqu3s", "acqu4s"]:
+        # extended by acqp
+        for f in ["acqus", "acqu2s", "acqu3s", "acqu4s", "acqp"]:
             if os.path.isfile(os.path.join(dir, f)):
                 acqus_files.append(f)
+    # extended by this output
+    else:
+        print("No Acquistion parameters file found!")
+        
 
     # create an empty dictionary
     dic = dict()
 
     # read the acqus_files and add to the dictionary
     for f in acqus_files:
-        dic[f] = read_jcamp(os.path.join(dir, f))
+        # dic[f] = read_jcamp(os.path.join(dir, f))
+        # replaced read_jcamp with alternative
+        dic[f] = read_JCAMP_reader(os.path.join(dir, f))
+        
+    return dic
+
+
+def read_method_file_Luca(dir='.', method_files=None):
+    """
+    edited by Luca
+    Read Bruker method files from a directory.
+    
+    Parameters
+    ----------
+    dir : str
+    Directory to read from.
+    method_files : list, optional
+    List of filename(s) of method parameter files in directory. None uses
+    standard files.
+    
+    Returns
+    -------
+    dic : dict
+    Dictionary of Bruker parameters.
+    
+    
+    """
+    if method_files is None:
+        method_files = []
+        # extended by acqp
+        for f in ["method", "methods"]:
+            if os.path.isfile(os.path.join(dir, f)):
+                method_files.append(f)
+
+    # extended by this output
+    else:
+        print("No method parameters file found!")
+        
+    # create an empty dictionary
+    dic = dict()
+    
+    # read the acqus_files and add to the dictionary
+    for f in method_files:
+        # dic[f] = read_jcamp(os.path.join(dir, f))
+        # replaced read_jcamp with alternative
+        dic[f] = read_JCAMP_reader(os.path.join(dir, f))
+    
     return dic
 
 
@@ -617,7 +856,9 @@ def read_procs_file(dir='.', procs_files=None):
 
     # read the acqus_files and add to the dictionary
     for f in procs_files:
-        dic[f] = read_jcamp(os.path.join(pdata_path, f))
+#        dic[f] = read_jcamp(os.path.join(pdata_path, f))
+        # replaced by : for JCAMPDX 4.24
+        dic[f] = read_JCAMP_reader(os.path.join(pdata_path, f))
     return dic
 
 
@@ -1522,6 +1763,67 @@ def read_binary(filename, shape=(1), cplex=True, big=True, isfloat=False):
         return dic, data
 
 
+
+def read_fid_Luca(filename, parameters = {}, shape=(1), cplex=True, big=True, isfloat=False):
+    """
+    Read Bruker binary data from file and return dic,data pair. + use knowledge
+    from paramter files
+
+    If data cannot be reshaped as described a 1D representation of the data
+    will be returned after printing a warning message.
+
+    Parameters
+    ----------
+    filename : str
+        Filename of Bruker binary file.
+    shape : tuple
+        Tuple describing shape of resulting data.
+    cplex : bool
+        Flag indicating if direct dimension is complex.
+    big : bool
+        Endianness of binary file, True for big-endian, False for
+        little-endian.
+    isfloat : bool
+        Data type of binary file. True for float64, False for int32.
+
+    Returns
+    -------
+    dic : dict
+        Dictionary containing "FILE_SIZE" key and value.
+    data : ndarray
+        Array of raw NMR data.
+
+    See Also
+    --------
+    read_binary_lowmem : Read Bruker binary file using minimal memory.
+
+    """
+    # open the file and get the data
+    with open(filename, 'rb') as f:
+        data = get_data(f, big=big, isfloat=isfloat)
+    
+#    blocksize = parameters['acqp']['acq_size'][1]
+    
+#    datares = data.reshape()
+    # complexify if needed
+    if cplex == False:
+        data = complexify_data(data)
+    else:
+        data = complexify_data(data)
+
+    # create dictionary
+    dic = {"FILE_SIZE": os.stat(filename).st_size}
+
+    # reshape if possible
+    try:
+        return dic, data.reshape(shape)
+
+    except ValueError:
+        warn(str(data.shape) + "cannot be shaped into" + str(shape))
+        return dic, data
+
+
+
 def read_binary_lowmem(filename, shape=(1), cplex=True, big=True,
                        isfloat=False):
     """
@@ -2093,7 +2395,7 @@ def rm_dig_filter(
 
 # JCAMP-DX functions
 
-def read_jcamp(filename, encoding=locale.getpreferredencoding()):
+def read_jcamp(filename):
     """
     Read a Bruker JCAMP-DX file into a dictionary.
 
@@ -2105,8 +2407,6 @@ def read_jcamp(filename, encoding=locale.getpreferredencoding()):
     ----------
     filename : str
         Filename of Bruker JCAMP-DX file.
-    encoding : str
-        Encoding of Bruker JCAMP-DX file. Defaults to the system default locale
 
     Returns
     -------
@@ -2125,7 +2425,7 @@ def read_jcamp(filename, encoding=locale.getpreferredencoding()):
     """
     dic = {"_coreheader": [], "_comments": []}  # create empty dictionary
 
-    with io.open(filename, 'r', encoding=encoding) as f:
+    with open(filename, 'r') as f:
         while True:     # loop until end of file is found
 
             line = f.readline().rstrip()    # read a line
@@ -2149,6 +2449,181 @@ def read_jcamp(filename, encoding=locale.getpreferredencoding()):
                 warn("Extraneous line:" + line)
 
     return dic
+
+def str2num(dic):
+    """
+    the scanned parameter values are now all saved as strings, this will turn
+    them into float values (hopefully only the ones that are supposed to be
+    turned into floats/ints)
+    
+    Parameters
+    ----------
+    dic: dictionary containing all scan parameters
+    
+    """
+    for key in dic:
+        if key != "FILE_SIZE":
+            for subkey in dic[key]:
+                # use regex
+                if subkey not in ["_comments"]:
+                    if re.findall('\d+',dic[key][subkey]) != []:
+                        if re.findall('[a-z]',dic[key][subkey]) == []:
+                            if re.findall('[A-Z]',dic[key][subkey]) == []:
+                                s2n = dic[key][subkey].split(' ')
+                                try:
+                                    s2n.remove(' ') # remove empty entries
+                                except:
+                                    pass  # or you could use 'continue'
+
+                                try:
+                                    s2n.remove('') # remove empty entries
+                                except:
+                                    pass
+                                if (len(s2n) > 1): # create list if more than 1 entry
+                                    s2nlist = []
+                                    for s in s2n:
+                                        if s != '':
+                                            s2nlist.append(float(re.findall(r'-?\d+\.?\d*',s)[0]))
+                                        else:
+                                            pass
+                                    dic[key][subkey] = s2nlist
+                                elif (len(s2n) == 1):
+                                    dic[key][subkey] = float(re.findall(r'-?\d+\.?\d*', s2n[0])[0])
+                                else:
+                                    print("Very Strange!")
+
+    return dic
+
+
+def read_JCAMP_reader(filename):
+    """
+    Read a Bruker JCAMP-DX 4.24 file into a dictionary.
+
+    Creates two special dictionary keys _coreheader and _comments Bruker
+    parameter "$FOO" are extracted into strings, floats or lists and assigned
+    to dic["FOO"]
+
+    Parameters
+    ----------
+    filename : str
+        Filename of Bruker JCAMP-DX file.
+
+    Returns
+    -------
+    dic : dict
+        Dictionary of parameters in file.
+
+    See Also
+    --------
+    write_jcamp : Write a Bruker JCAMP-DX file.
+
+    Notes
+    -----
+    This is not a fully functional JCAMP-DX reader, it is only intended
+    to read Bruker acqus (and similar) files.
+
+    """
+    dic = {"_comments": []}  # create empty dictionary
+    jumpback = False # parameter that help to "go back" one line if next line
+    # is new parameter
+    last_pos = 1 # parameter to remeber where to "go back" to
+    with open(filename, 'r') as f:
+        while True:     # loop until end of file is found
+            # continue 
+            if jumpback == False:
+                line = f.readline().rstrip()    # read a line
+            else:
+                f.seek(last_pos) # go to last_pos in f(ile)
+                jumpback = False # reset parameter
+            if line == '':      # end of file found
+                break
+
+            if line[:6] == "##END=":
+                # print("End of file")
+                break
+            elif line[:3] == "##$":
+                line = line.strip("##$") # remove this part from the beginning
+                try:
+                    (lhs,rhs) = line.split('=', 1) # split line at "="-sign
+                    # ( indicates interseting parameter is in next line:
+                    if rhs[0:2] == "( ": # in JCAMPDX 4.24 Bruker this 
+                        # indicates that the interesting stuff is in the next 
+                        # line
+                        
+                        dic[lhs] = "" # init lhs-key and empty string
+                        line = f.readline().rstrip() # read nextline
+                        while line[0] not in ['$', '#']: # $,# = new parameter
+                            # add next line to dict under key lhs
+                            dic[lhs] = dic[lhs] + " " +line
+                            # read next line:
+                            line = f.readline().rstrip()
+                            # store position in case next line is new parameter
+                            last_pos = f.tell()
+                        else:
+                            # line is new parameter --> jump back to read in
+                            # new parameter
+                            jumpback = True
+                    elif rhs[0:1] == "(": # if something follow after ( -->
+                        # there is information is this line
+                        dic[lhs] = rhs # store information
+                        line = f.readline().rstrip() # read next line
+                        last_pos = f.tell() # store position in case next line
+                        # is new parameter
+                        
+                        while line[0] not in ['$', '#']:
+                            # add next line to dict under key lhs
+                            dic[lhs] = dic[lhs] + " " +line
+                            # read in next line
+                            line = f.readline().rstrip()
+                            # store position
+                            last_pos = f.tell()
+                        else:
+                            # go back to prev. line
+                            jumpback = True
+                    else:
+                        dic[lhs] = rhs 
+                except:
+                    warn("Extraneous line:" + line)
+            elif line[:2] == "##":
+                line = line.strip("##")
+                try:
+                    (lhs,rhs) = line.split('=', 1)
+                    dic[lhs] = rhs
+                except:
+                    warn("Extraneous line:" + line)
+            
+            elif line[:2] == '$$':
+                line = line.strip('$$ ')
+                dic["_comments"].append(line)
+            else:
+                warn("Extraneous line:" + line)
+
+    return dic
+    # temp = {}
+    # dic = {}  # create empty dictionary
+    for key in dic:
+        if key[0] == "$":
+            if key[0:1] == "$$":
+                dic[key[2:]] = dic.pop(key)
+            else:
+                dic[key[1:]] = dic.pop(key)
+        else:
+            dic[key] = dic[key]
+
+    # not the most efficient but the convinient way of sorting out $s
+    for key in dic:
+        if key[0] == "$":
+            if key[0:1] == "$$":
+                dic[key[2:]] = dic.pop(key)
+            else:
+                dic[key[1:]] = dic.pop(key)
+        else:
+            dic[key] = dic[key]
+        
+    return dic
+
+
+
 
 
 def parse_jcamp_line(line, f):
@@ -2201,21 +2676,13 @@ def parse_jcamp_value(text):
     """
     Parse value text from Bruker JCAMP-DX file returning the value.
     """
-    if text == '':
-        return None
-    elif text.startswith('<') and text.endswith('>'):
+    if "<" in text:
         return text[1:-1]  # remove < and >
+    elif "." in text or "e" in text or 'inf' in text:
+        return float(text)
     else:
-        if "." in text or "e" in text or 'inf' in text:
-            try:
-                return float(text)
-            except ValueError:
-                return text
-        else:
-            try:
-                return int(text)
-            except ValueError:
-                return text
+        return int(text)
+
 
 def write_jcamp(dic, filename, overwrite=False):
     """
@@ -2501,7 +2968,36 @@ def read_pprog(filename):
            "ph_extra": ph_extra}
     return dic
 
+def read_ppg_Luca(filename):
+    """
+    most simple approach, just read in the whole file with comments etc ...
+    Parameters
+    ----------
+    filename : str
+        Filename of file to read pulse program from.
+    """
+    warn("Needs work")
 
+    pulprog = dict()
+    pulprog['ppg'] = dict()
+    
+    counter = 0
+    # open the file
+    with open(filename) as f:
+    # read whole pulseprogramm
+        for line in f:
+            pulprog['ppg']['line_'+str(counter)] = line.rstrip('\\n')
+            counter = counter + 1
+    # close the file
+    f.close()
+    
+    return pulprog
+    
+        
+    
+    
+    
+    
 def write_pprog(filename, dic, overwrite=False):
     """
     Write a minimal Bruker pulse program to file.
